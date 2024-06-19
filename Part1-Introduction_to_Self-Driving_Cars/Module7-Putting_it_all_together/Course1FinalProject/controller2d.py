@@ -4,18 +4,8 @@
 2D Controller Class to be used for the CARLA waypoint follower demo.
 """
 
-import numpy as np
 import cutils
-from sympy import integrate
-import math
-
-Kp = 2.0        #speed proportional gain
-Ki = 0.05       
-Kd = 0.01
-
-k = 0.1         #look forward gain
-Lfc = 1.0       #look-ahead distance
-L = 2.9
+import numpy as np
 
 class Controller2D(object):
     def __init__(self, waypoints):
@@ -124,6 +114,13 @@ class Controller2D(object):
             throttle_output = 0.5 * self.vars.v_previous
         """
         self.vars.create_var('v_previous', 0.0)
+        self.vars.create_var('t_previous', 0.0)
+        self.vars.create_var('error_previous', 0.0)
+        self.vars.create_var('integral_error_previous', 0.0)
+        self.vars.create_var('throttle_previous', 0.0)
+        self.vars.create_var('acc_max', 0.0)
+        e_v = 0
+        int_e_v = 0
 
         # Skip the first frame to store previous values properly
         if self._start_control_loop:
@@ -173,10 +170,37 @@ class Controller2D(object):
             # Change these outputs with the longitudinal controller. Note that
             # brake_output is optional and is not required to pass the
             # assignment, as the car will naturally slow down over time.
-            a = Kp * (v_desired - v)
 
-            throttle_output = a * t + throttle_output
+            kp = 1.0
+            ki = 0.2
+            kd = 0.01
+
+            throttle_output = 0
             brake_output    = 0
+
+            # pid control
+            st = t - self.vars.t_previous
+
+            # error term
+            e_v = v_desired - v
+
+            # I
+            int_e_v = self.vars.integral_error_previous + e_v * st
+
+            # D
+            der_e_v = (e_v - self.vars.error_previous) / st
+
+            acc = kp * e_v + ki * int_e_v + kd * der_e_v
+
+            acc = kp * e_v + ki * int_e_v + kd * der_e_v
+            if acc > self.vars.acc_max:
+                self.vars.acc_max = acc
+                throttle_output = 0.99
+            elif acc < 0:
+                throttle_output = 0
+            else:
+                throttle_output = acc/self.vars.acc_max
+
 
             ######################################################
             ######################################################
@@ -190,26 +214,50 @@ class Controller2D(object):
             """
             
             # Change the steer output with the lateral controller. 
-            # pure pursuit method
-            # search nearest point index   
-            length = np.arange(0,100,1)
-            dx = [self._current_x - waypoints[icx][0] for icx in length]
-            dy = [self._current_y - waypoints[icy][1] for icy in length]
-            d = [abs(math.sqrt(idx ** 2 + idy ** 2)) for (idx,idy) in zip(dx,dy)]
-            ind = d.index(min(d))
-            if ind < 2:
-                tx = waypoints[ind][0]
-                ty = waypoints[ind][1]  
-            else:
-                tx = waypoints[-1][0]
-                ty = waypoints[-1][1]
-                # ind = len(self._current_x) - 1    
+            steer_output = 0
 
-            alpha_hat = math.atan2(ty - y,tx - x)
-            alpha = alpha_hat - yaw
-            Lf = k * v + Lfc
-            steer_output = math.atan2(2.0 * L * math.sin(alpha) / Lf,1.0)
-            print("steer_output = ",steer_output)
+            # Use stanley controller for lateral control
+            k_e = 0.3
+            slope = (waypoints[-1][1]-waypoints[0][1])/ (waypoints[-1][0]-waypoints[0][0])
+            a = -slope
+            b = 1.0
+            c = (slope*waypoints[0][0]) - waypoints[0][1]
+
+            # heading error
+            yaw_path = np.arctan2(waypoints[-1][1]-waypoints[0][1], waypoints[-1][0]-waypoints[0][0])
+            # yaw_path = np.arctan2(slope, 1.0)  # This was turning the vehicle only to the right (some error)
+            yaw_diff_heading = yaw_path - yaw 
+            if yaw_diff_heading > np.pi:
+                yaw_diff_heading -= 2 * np.pi
+            if yaw_diff_heading < - np.pi:
+                yaw_diff_heading += 2 * np.pi
+
+            # crosstrack erroe
+            current_xy = np.array([x, y])
+            crosstrack_error = np.min(np.sum((current_xy - np.array(waypoints)[:, :2])**2, axis=1))
+            yaw_cross_track = np.arctan2(y-waypoints[0][1], x-waypoints[0][0])
+            yaw_path2ct = yaw_path - yaw_cross_track
+            if yaw_path2ct > np.pi:
+                yaw_path2ct -= 2 * np.pi
+            if yaw_path2ct < - np.pi:
+                yaw_path2ct += 2 * np.pi
+            if yaw_path2ct > 0:
+                crosstrack_error = abs(crosstrack_error)
+            else:
+                crosstrack_error = - abs(crosstrack_error)
+            yaw_diff_crosstrack = np.arctan(k_e * crosstrack_error / (v))
+
+            # final expected steering
+            steer_expect = yaw_diff_crosstrack + yaw_diff_heading
+            if steer_expect > np.pi:
+                steer_expect -= 2 * np.pi
+            if steer_expect < - np.pi:
+                steer_expect += 2 * np.pi
+            steer_expect = min(1.22, steer_expect)
+            steer_expect = max(-1.22, steer_expect)
+
+            #update
+            steer_output = steer_expect
 
             ######################################################
             # SET CONTROLS OUTPUT
@@ -217,7 +265,6 @@ class Controller2D(object):
             self.set_throttle(throttle_output)  # in percent (0 to 1)
             self.set_steer(steer_output)        # in rad (-1.22 to 1.22)
             self.set_brake(brake_output)        # in percent (0 to 1)
-
 
         ######################################################
         ######################################################
@@ -230,3 +277,7 @@ class Controller2D(object):
             in the next iteration)
         """
         self.vars.v_previous = v  # Store forward speed to be used in next step
+        self.vars.throttle_previous = throttle_output
+        self.vars.t_previous = t
+        self.vars.error_previous = e_v
+        self.vars.integral_error_previous = int_e_v
